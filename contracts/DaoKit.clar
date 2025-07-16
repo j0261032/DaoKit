@@ -8,11 +8,22 @@
 (define-constant ERR_INVALID_DURATION (err u106))
 (define-constant ERR_MODULE_NOT_FOUND (err u107))
 (define-constant ERR_MODULE_ALREADY_EXISTS (err u108))
+(define-constant ERR_BUDGET_NOT_FOUND (err u109))
+(define-constant ERR_BUDGET_ALREADY_EXISTS (err u110))
+(define-constant ERR_INSUFFICIENT_TREASURY (err u111))
+(define-constant ERR_PAYMENT_NOT_FOUND (err u112))
+(define-constant ERR_PAYMENT_ALREADY_EXECUTED (err u113))
+(define-constant ERR_PAYMENT_NOT_DUE (err u114))
+(define-constant ERR_INVALID_AMOUNT (err u115))
+(define-constant ERR_BUDGET_EXCEEDED (err u116))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var dao-name (string-ascii 50) "")
 (define-data-var min-proposal-threshold uint u1000)
 (define-data-var voting-duration uint u1440)
+(define-data-var treasury-balance uint u0)
+(define-data-var budget-counter uint u0)
+(define-data-var payment-counter uint u0)
 
 (define-map proposals
   uint
@@ -51,6 +62,46 @@
 (define-map module-permissions
   { module: (string-ascii 50), permission: (string-ascii 50) }
   bool
+)
+
+(define-map treasury-budgets
+  uint
+  {
+    name: (string-ascii 50),
+    allocated-amount: uint,
+    spent-amount: uint,
+    period-start: uint,
+    period-end: uint,
+    category: (string-ascii 30),
+    manager: principal,
+    active: bool
+  }
+)
+
+(define-map scheduled-payments
+  uint
+  {
+    recipient: principal,
+    amount: uint,
+    due-block: uint,
+    budget-id: uint,
+    description: (string-ascii 100),
+    executed: bool,
+    recurring: bool,
+    interval: uint
+  }
+)
+
+(define-map treasury-transactions
+  uint
+  {
+    transaction-type: (string-ascii 20),
+    amount: uint,
+    block-height: uint,
+    related-entity: principal,
+    description: (string-ascii 100),
+    budget-id: (optional uint)
+  }
 )
 
 (define-public (initialize-dao (name (string-ascii 50)) (threshold uint) (duration uint))
@@ -222,5 +273,233 @@
       (> (default-to u0 (map-get? member-tokens voter)) u0)
     )
     false
+  )
+)
+
+(define-public (deposit-treasury (amount uint))
+  (begin
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (var-set treasury-balance (+ (var-get treasury-balance) amount))
+    (map-set treasury-transactions 
+      (+ (var-get proposal-counter) u1)
+      {
+        transaction-type: "deposit",
+        amount: amount,
+        block-height: stacks-block-height,
+        related-entity: tx-sender,
+        description: "Treasury deposit",
+        budget-id: none
+      })
+    (ok true)
+  )
+)
+
+(define-public (create-budget (name (string-ascii 50)) (amount uint) (period-duration uint) (category (string-ascii 30)) (manager principal))
+  (let ((budget-id (+ (var-get budget-counter) u1)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> period-duration u0) ERR_INVALID_DURATION)
+    (asserts! (is-none (map-get? treasury-budgets budget-id)) ERR_BUDGET_ALREADY_EXISTS)
+    (asserts! (>= (var-get treasury-balance) amount) ERR_INSUFFICIENT_TREASURY)
+    
+    (map-set treasury-budgets budget-id {
+      name: name,
+      allocated-amount: amount,
+      spent-amount: u0,
+      period-start: stacks-block-height,
+      period-end: (+ stacks-block-height period-duration),
+      category: category,
+      manager: manager,
+      active: true
+    })
+    (var-set budget-counter budget-id)
+    (ok budget-id)
+  )
+)
+
+(define-public (allocate-budget-funds (budget-id uint) (additional-amount uint))
+  (let ((budget (unwrap! (map-get? treasury-budgets budget-id) ERR_BUDGET_NOT_FOUND)))
+    (asserts! (or (is-eq tx-sender CONTRACT_OWNER) 
+                  (is-eq tx-sender (get manager budget))) ERR_UNAUTHORIZED)
+    (asserts! (> additional-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (var-get treasury-balance) additional-amount) ERR_INSUFFICIENT_TREASURY)
+    
+    (map-set treasury-budgets budget-id 
+      (merge budget { allocated-amount: (+ (get allocated-amount budget) additional-amount) }))
+    (ok true)
+  )
+)
+
+(define-public (spend-from-budget (budget-id uint) (amount uint) (recipient principal) (description (string-ascii 100)))
+  (let ((budget (unwrap! (map-get? treasury-budgets budget-id) ERR_BUDGET_NOT_FOUND)))
+    (asserts! (or (is-eq tx-sender CONTRACT_OWNER) 
+                  (is-eq tx-sender (get manager budget))) ERR_UNAUTHORIZED)
+    (asserts! (get active budget) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= (+ (get spent-amount budget) amount) (get allocated-amount budget)) ERR_BUDGET_EXCEEDED)
+    (asserts! (>= (var-get treasury-balance) amount) ERR_INSUFFICIENT_TREASURY)
+    
+    (map-set treasury-budgets budget-id 
+      (merge budget { spent-amount: (+ (get spent-amount budget) amount) }))
+    (var-set treasury-balance (- (var-get treasury-balance) amount))
+    
+    (map-set treasury-transactions 
+      (+ (var-get proposal-counter) u1)
+      {
+        transaction-type: "spend",
+        amount: amount,
+        block-height: stacks-block-height,
+        related-entity: recipient,
+        description: description,
+        budget-id: (some budget-id)
+      })
+    (ok true)
+  )
+)
+
+(define-public (schedule-payment (recipient principal) (amount uint) (due-block uint) (budget-id uint) (description (string-ascii 100)) (recurring bool) (interval uint))
+  (let ((payment-id (+ (var-get payment-counter) u1))
+        (budget (unwrap! (map-get? treasury-budgets budget-id) ERR_BUDGET_NOT_FOUND)))
+    (asserts! (or (is-eq tx-sender CONTRACT_OWNER) 
+                  (is-eq tx-sender (get manager budget))) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> due-block stacks-block-height) ERR_INVALID_DURATION)
+    (asserts! (<= (+ (get spent-amount budget) amount) (get allocated-amount budget)) ERR_BUDGET_EXCEEDED)
+    
+    (map-set scheduled-payments payment-id {
+      recipient: recipient,
+      amount: amount,
+      due-block: due-block,
+      budget-id: budget-id,
+      description: description,
+      executed: false,
+      recurring: recurring,
+      interval: interval
+    })
+    (var-set payment-counter payment-id)
+    (ok payment-id)
+  )
+)
+
+(define-public (execute-scheduled-payment (payment-id uint))
+  (let ((payment (unwrap! (map-get? scheduled-payments payment-id) ERR_PAYMENT_NOT_FOUND))
+        (budget (unwrap! (map-get? treasury-budgets (get budget-id payment)) ERR_BUDGET_NOT_FOUND)))
+    (asserts! (not (get executed payment)) ERR_PAYMENT_ALREADY_EXECUTED)
+    (asserts! (>= stacks-block-height (get due-block payment)) ERR_PAYMENT_NOT_DUE)
+    (asserts! (>= (var-get treasury-balance) (get amount payment)) ERR_INSUFFICIENT_TREASURY)
+    
+    (map-set treasury-budgets (get budget-id payment)
+      (merge budget { spent-amount: (+ (get spent-amount budget) (get amount payment)) }))
+    (var-set treasury-balance (- (var-get treasury-balance) (get amount payment)))
+    
+    (if (get recurring payment)
+      (map-set scheduled-payments payment-id 
+        (merge payment { 
+          due-block: (+ (get due-block payment) (get interval payment)),
+          executed: false
+        }))
+      (map-set scheduled-payments payment-id 
+        (merge payment { executed: true })))
+    
+    (map-set treasury-transactions 
+      (+ (var-get proposal-counter) u1)
+      {
+        transaction-type: "scheduled",
+        amount: (get amount payment),
+        block-height: stacks-block-height,
+        related-entity: (get recipient payment),
+        description: (get description payment),
+        budget-id: (some (get budget-id payment))
+      })
+    (ok true)
+  )
+)
+
+(define-public (toggle-budget-status (budget-id uint))
+  (let ((budget (unwrap! (map-get? treasury-budgets budget-id) ERR_BUDGET_NOT_FOUND)))
+    (asserts! (or (is-eq tx-sender CONTRACT_OWNER) 
+                  (is-eq tx-sender (get manager budget))) ERR_UNAUTHORIZED)
+    (map-set treasury-budgets budget-id 
+      (merge budget { active: (not (get active budget)) }))
+    (ok true)
+  )
+)
+
+(define-public (emergency-withdraw (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (var-get treasury-balance) amount) ERR_INSUFFICIENT_TREASURY)
+    
+    (var-set treasury-balance (- (var-get treasury-balance) amount))
+    (map-set treasury-transactions 
+      (+ (var-get proposal-counter) u1)
+      {
+        transaction-type: "emergency",
+        amount: amount,
+        block-height: stacks-block-height,
+        related-entity: tx-sender,
+        description: "Emergency withdrawal",
+        budget-id: none
+      })
+    (ok true)
+  )
+)
+
+(define-read-only (get-treasury-balance)
+  (var-get treasury-balance)
+)
+
+(define-read-only (get-budget (budget-id uint))
+  (map-get? treasury-budgets budget-id)
+)
+
+(define-read-only (get-payment (payment-id uint))
+  (map-get? scheduled-payments payment-id)
+)
+
+(define-read-only (get-budget-utilization (budget-id uint))
+  (match (map-get? treasury-budgets budget-id)
+    budget
+    {
+      allocated: (get allocated-amount budget),
+      spent: (get spent-amount budget),
+      remaining: (- (get allocated-amount budget) (get spent-amount budget)),
+      utilization-rate: (if (> (get allocated-amount budget) u0)
+                          (/ (* (get spent-amount budget) u100) (get allocated-amount budget))
+                          u0)
+    }
+    {
+      allocated: u0,
+      spent: u0,
+      remaining: u0,
+      utilization-rate: u0
+    }
+  )
+)
+
+(define-read-only (get-treasury-summary)
+  {
+    total-balance: (var-get treasury-balance),
+    total-budgets: (var-get budget-counter),
+    total-payments: (var-get payment-counter)
+  }
+)
+
+(define-read-only (get-budget-status (budget-id uint))
+  (match (map-get? treasury-budgets budget-id)
+    budget
+    {
+      active: (get active budget),
+      expired: (> stacks-block-height (get period-end budget)),
+      funds-available: (> (get allocated-amount budget) (get spent-amount budget)),
+      manager: (get manager budget)
+    }
+    {
+      active: false,
+      expired: true,
+      funds-available: false,
+      manager: CONTRACT_OWNER
+    }
   )
 )
