@@ -16,6 +16,12 @@
 (define-constant ERR_PAYMENT_NOT_DUE (err u114))
 (define-constant ERR_INVALID_AMOUNT (err u115))
 (define-constant ERR_BUDGET_EXCEEDED (err u116))
+(define-constant ERR_ACHIEVEMENT_NOT_FOUND (err u117))
+(define-constant ERR_ACHIEVEMENT_ALREADY_EXISTS (err u118))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u119))
+(define-constant ERR_INVALID_MERIT_POINTS (err u120))
+(define-constant ERR_MEMBER_NOT_FOUND (err u121))
+(define-constant ERR_INVALID_CATEGORY (err u122))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var dao-name (string-ascii 50) "")
@@ -24,6 +30,8 @@
 (define-data-var treasury-balance uint u0)
 (define-data-var budget-counter uint u0)
 (define-data-var payment-counter uint u0)
+(define-data-var achievement-counter uint u0)
+(define-data-var reputation-multiplier uint u100)
 
 (define-map proposals
   uint
@@ -101,6 +109,53 @@
     related-entity: principal,
     description: (string-ascii 100),
     budget-id: (optional uint)
+  }
+)
+
+(define-map member-reputation
+  principal
+  {
+    total-points: uint,
+    governance-points: uint,
+    contribution-points: uint,
+    achievement-count: uint,
+    join-block: uint,
+    last-activity: uint,
+    reputation-level: uint
+  }
+)
+
+(define-map achievements
+  uint
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 100),
+    category: (string-ascii 30),
+    points-reward: uint,
+    requirements: (string-ascii 100),
+    active: bool,
+    created-by: principal
+  }
+)
+
+(define-map member-achievements
+  { member: principal, achievement-id: uint }
+  {
+    earned-block: uint,
+    points-earned: uint,
+    verified: bool
+  }
+)
+
+(define-map reputation-activities
+  uint
+  {
+    member: principal,
+    activity-type: (string-ascii 30),
+    points-change: uint,
+    block-height: uint,
+    description: (string-ascii 100),
+    related-proposal: (optional uint)
   }
 )
 
@@ -503,3 +558,255 @@
     }
   )
 )
+
+(define-public (register-member (member principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-none (map-get? member-reputation member)) ERR_MEMBER_NOT_FOUND)
+    (map-set member-reputation member {
+      total-points: u0,
+      governance-points: u0,
+      contribution-points: u0,
+      achievement-count: u0,
+      join-block: stacks-block-height,
+      last-activity: stacks-block-height,
+      reputation-level: u1
+    })
+    (ok true)
+  )
+)
+
+(define-public (create-achievement (name (string-ascii 50)) (description (string-ascii 100)) (category (string-ascii 30)) (points-reward uint) (requirements (string-ascii 100)))
+  (let ((achievement-id (+ (var-get achievement-counter) u1)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> points-reward u0) ERR_INVALID_MERIT_POINTS)
+    (asserts! (is-none (map-get? achievements achievement-id)) ERR_ACHIEVEMENT_ALREADY_EXISTS)
+    
+    (map-set achievements achievement-id {
+      name: name,
+      description: description,
+      category: category,
+      points-reward: points-reward,
+      requirements: requirements,
+      active: true,
+      created-by: tx-sender
+    })
+    (var-set achievement-counter achievement-id)
+    (ok achievement-id)
+  )
+)
+
+(define-public (award-achievement (member principal) (achievement-id uint))
+  (let ((achievement (unwrap! (map-get? achievements achievement-id) ERR_ACHIEVEMENT_NOT_FOUND))
+        (member-rep (unwrap! (map-get? member-reputation member) ERR_MEMBER_NOT_FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (get active achievement) ERR_ACHIEVEMENT_NOT_FOUND)
+    (asserts! (is-none (map-get? member-achievements { member: member, achievement-id: achievement-id })) ERR_ACHIEVEMENT_ALREADY_EXISTS)
+    
+    (map-set member-achievements { member: member, achievement-id: achievement-id } {
+      earned-block: stacks-block-height,
+      points-earned: (get points-reward achievement),
+      verified: true
+    })
+    
+    (map-set member-reputation member 
+      (merge member-rep {
+        total-points: (+ (get total-points member-rep) (get points-reward achievement)),
+        achievement-count: (+ (get achievement-count member-rep) u1),
+        last-activity: stacks-block-height,
+        reputation-level: (calculate-reputation-level (+ (get total-points member-rep) (get points-reward achievement)))
+      }))
+    
+    (map-set reputation-activities 
+      (+ (var-get proposal-counter) u1)
+      {
+        member: member,
+        activity-type: "achievement",
+        points-change: (get points-reward achievement),
+        block-height: stacks-block-height,
+        description: (get name achievement),
+        related-proposal: none
+      })
+    (ok true)
+  )
+)
+
+(define-public (add-governance-points (member principal) (points uint) (proposal-id (optional uint)))
+  (let ((member-rep (unwrap! (map-get? member-reputation member) ERR_MEMBER_NOT_FOUND)))
+    (asserts! (or (is-eq tx-sender CONTRACT_OWNER) 
+                  (is-eq tx-sender member)) ERR_UNAUTHORIZED)
+    (asserts! (> points u0) ERR_INVALID_MERIT_POINTS)
+    
+    (map-set member-reputation member 
+      (merge member-rep {
+        total-points: (+ (get total-points member-rep) points),
+        governance-points: (+ (get governance-points member-rep) points),
+        last-activity: stacks-block-height,
+        reputation-level: (calculate-reputation-level (+ (get total-points member-rep) points))
+      }))
+    
+    (map-set reputation-activities 
+      (+ (var-get proposal-counter) u1)
+      {
+        member: member,
+        activity-type: "governance",
+        points-change: points,
+        block-height: stacks-block-height,
+        description: "Governance participation",
+        related-proposal: proposal-id
+      })
+    (ok true)
+  )
+)
+
+(define-public (add-contribution-points (member principal) (points uint) (description (string-ascii 100)))
+  (let ((member-rep (unwrap! (map-get? member-reputation member) ERR_MEMBER_NOT_FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> points u0) ERR_INVALID_MERIT_POINTS)
+    
+    (map-set member-reputation member 
+      (merge member-rep {
+        total-points: (+ (get total-points member-rep) points),
+        contribution-points: (+ (get contribution-points member-rep) points),
+        last-activity: stacks-block-height,
+        reputation-level: (calculate-reputation-level (+ (get total-points member-rep) points))
+      }))
+    
+    (map-set reputation-activities 
+      (+ (var-get proposal-counter) u1)
+      {
+        member: member,
+        activity-type: "contribution",
+        points-change: points,
+        block-height: stacks-block-height,
+        description: description,
+        related-proposal: none
+      })
+    (ok true)
+  )
+)
+
+(define-public (penalize-member (member principal) (points uint) (reason (string-ascii 100)))
+  (let ((member-rep (unwrap! (map-get? member-reputation member) ERR_MEMBER_NOT_FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> points u0) ERR_INVALID_MERIT_POINTS)
+    
+    (let ((new-total (if (>= (get total-points member-rep) points)
+                       (- (get total-points member-rep) points)
+                       u0)))
+      (map-set member-reputation member 
+        (merge member-rep {
+          total-points: new-total,
+          last-activity: stacks-block-height,
+          reputation-level: (calculate-reputation-level new-total)
+        }))
+      
+      (map-set reputation-activities 
+        (+ (var-get proposal-counter) u1)
+        {
+          member: member,
+          activity-type: "penalty",
+          points-change: points,
+          block-height: stacks-block-height,
+          description: reason,
+          related-proposal: none
+        })
+      (ok true)
+    )
+  )
+)
+
+(define-public (toggle-achievement-status (achievement-id uint))
+  (let ((achievement (unwrap! (map-get? achievements achievement-id) ERR_ACHIEVEMENT_NOT_FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set achievements achievement-id 
+      (merge achievement { active: (not (get active achievement)) }))
+    (ok true)
+  )
+)
+
+(define-public (update-reputation-multiplier (new-multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> new-multiplier u0) ERR_INVALID_AMOUNT)
+    (var-set reputation-multiplier new-multiplier)
+    (ok true)
+  )
+)
+
+(define-private (calculate-reputation-level (total-points uint))
+  (if (<= total-points u100) u1
+    (if (<= total-points u500) u2
+      (if (<= total-points u1000) u3
+        (if (<= total-points u2500) u4
+          (if (<= total-points u5000) u5
+            u6)))))
+)
+
+(define-read-only (get-member-reputation (member principal))
+  (map-get? member-reputation member)
+)
+
+(define-read-only (get-achievement (achievement-id uint))
+  (map-get? achievements achievement-id)
+)
+
+(define-read-only (get-member-achievement (member principal) (achievement-id uint))
+  (map-get? member-achievements { member: member, achievement-id: achievement-id })
+)
+
+(define-read-only (calculate-voting-power (member principal))
+  (match (map-get? member-reputation member)
+    reputation
+    (let ((base-tokens (default-to u0 (map-get? member-tokens member)))
+          (reputation-bonus (/ (* (get total-points reputation) (var-get reputation-multiplier)) u100)))
+      (+ base-tokens reputation-bonus))
+    (default-to u0 (map-get? member-tokens member))
+  )
+)
+
+(define-read-only (get-reputation-stats)
+  {
+    total-achievements: (var-get achievement-counter),
+    reputation-multiplier: (var-get reputation-multiplier)
+  }
+)
+
+(define-read-only (get-member-level-info (member principal))
+  (match (map-get? member-reputation member)
+    reputation
+    {
+      current-level: (get reputation-level reputation),
+      total-points: (get total-points reputation),
+      next-level-threshold: (get-level-threshold (+ (get reputation-level reputation) u1)),
+      points-to-next: (if (< (get reputation-level reputation) u6)
+                        (- (get-level-threshold (+ (get reputation-level reputation) u1)) (get total-points reputation))
+                        u0)
+    }
+    {
+      current-level: u0,
+      total-points: u0,
+      next-level-threshold: u100,
+      points-to-next: u100
+    }
+  )
+)
+
+(define-read-only (get-level-threshold (level uint))
+  (if (is-eq level u1) u0
+    (if (is-eq level u2) u100
+      (if (is-eq level u3) u500
+        (if (is-eq level u4) u1000
+          (if (is-eq level u5) u2500
+            (if (is-eq level u6) u5000
+              u10000))))))
+)
+
+(define-read-only (get-top-contributors (limit uint))
+  {
+    message: "Use external indexing for leaderboard queries",
+    total-members: "Check member-reputation map"
+  }
+)
+
+
